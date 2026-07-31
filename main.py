@@ -5,6 +5,7 @@ import random
 import socket
 import struct
 import sys
+import time
 from typing import List, Tuple, Dict, Any, Callable, Sequence
 
 
@@ -166,6 +167,50 @@ def get_nameserver(parsed_packet: Dict[str, Any]):
     return None
 
 
+class DNSCache:
+    """Simple in-memory TTL-aware cache keyed by (name, type).
+
+    Stores parsed record dicts (with keys: name, type, class, ttl, data)
+    and returns them while they are still fresh.
+    """
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+        self._store: Dict[Tuple[str, int], List[Tuple[Dict[str, Any], float]]] = {}
+
+    def _key(self, name: str, rtype: int) -> Tuple[str, int]:
+        return normalize_name(name), rtype
+
+    def put_record(self, record: Dict[str, Any]) -> None:
+        key = self._key(record['name'], record['type'])
+        expiry = self._clock() + max(int(record.get('ttl', 0)), 0)
+        self._store.setdefault(key, []).append((record, expiry))
+
+    def put_parsed_packet(self, parsed: Dict[str, Any]) -> None:
+        for r in (*parsed.get('answers', []), *parsed.get('authorities', []), *parsed.get('additionals', [])):
+            try:
+                self.put_record(r)
+            except Exception:
+                # ignore malformed records while caching
+                continue
+
+    def lookup_records(self, name: str, rtype: int) -> List[Dict[str, Any]]:
+        key = self._key(name, rtype)
+        now = self._clock()
+        entries = self._store.get(key, [])
+        alive = [rec for (rec, exp) in entries if exp > now]
+        if alive:
+            # prune expired
+            self._store[key] = [(rec, exp) for (rec, exp) in entries if exp > now]
+            return alive
+        if key in self._store:
+            del self._store[key]
+        return []
+
+
+# module-level cache used by resolve()
+GLOBAL_CACHE = DNSCache()
+
+
 def resolve(
     domain_name: str,
     qtype: int = 1,
@@ -186,10 +231,19 @@ def resolve(
         send_parse_func = default_send_parse
 
     qname = normalize_name(domain_name)
+    # check cache first
+    cached = GLOBAL_CACHE.lookup_records(qname, qtype)
+    if cached:
+        return cached[0]['data']
     nameserver = root_servers[0]
     # simple loop (no caching, no CNAME handling here)
     while True:
         pkt = send_parse_func(nameserver, qname, qtype)
+        # cache parsed records (answers, authorities, additionals)
+        try:
+            GLOBAL_CACHE.put_parsed_packet(pkt)
+        except Exception:
+            pass
         ans = get_answer(pkt)
         if ans:
             return ans
@@ -232,6 +286,10 @@ def _selftest() -> None:
 
     assert resolve('example.com', send_parse_func=fake_send_parse) == '93.184.216.34'
     assert calls == [('198.41.0.4', 'example.com', 1), ('203.0.113.53', 'example.com', 1)]
+    # second resolve should be served from cache and not call the network
+    calls_before = len(calls)
+    assert resolve('example.com') == '93.184.216.34'
+    assert len(calls) == calls_before
     print('part3 self-test passed')
 
 
