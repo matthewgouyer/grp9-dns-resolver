@@ -1,26 +1,5 @@
-"""
-Phase 1 — Part 1 (incremental commit)
-
-This version implements:
-- DNS name encoding (labels)
-- Building a DNS query packet (header + question)
-- Sending the UDP query and returning the raw response bytes
-
-This is intentionally minimal; parsing and resolution logic will be added
-in later commits for Part 2 and Part 3.
-"""
-
-"""
-Phase 1 — Part 3 (incremental commit)
-
-This version adds the iterative resolver: starting from a root server,
-it follows referrals (authority records + glue in additionals) down
-to an authoritative server and returns an A record. This commit keeps
-the single-file layout; caching and Phase 2/3 extensions will be added
-in later commits.
-"""
-
 from __future__ import annotations
+
 
 import random
 import socket
