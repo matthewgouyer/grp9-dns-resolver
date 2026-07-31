@@ -11,11 +11,13 @@ in later commits for Part 2 and Part 3.
 """
 
 """
-Phase 1 — Part 2 (incremental commit)
+Phase 1 — Part 3 (incremental commit)
 
-This version expands Part 1 by adding parsing of DNS responses and
-DNS name decompression (pointer handling). The resolver logic (walk
-from root to authoritative) will be added in Part 3.
+This version adds the iterative resolver: starting from a root server,
+it follows referrals (authority records + glue in additionals) down
+to an authoritative server and returns an A record. This commit keeps
+the single-file layout; caching and Phase 2/3 extensions will be added
+in later commits.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import random
 import socket
 import struct
 import sys
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Callable, Sequence
 
 
 DEFAULT_ROOT_SERVERS = ("198.41.0.4",)
@@ -164,12 +166,94 @@ def parse_dns_packet(message: bytes) -> Dict[str, Any]:
     return {'header': header, 'questions': questions, 'answers': answers, 'authorities': authorities, 'additionals': additionals}
 
 
+def get_answer(parsed_packet: Dict[str, Any]):
+    for r in parsed_packet['answers']:
+        if r['type'] == 1:
+            return r['data']
+    return None
+
+
+def get_nameserver_ip(parsed_packet: Dict[str, Any]):
+    for r in parsed_packet['additionals']:
+        if r['type'] == 1:
+            return r['data']
+    return None
+
+
+def get_nameserver(parsed_packet: Dict[str, Any]):
+    for r in parsed_packet['authorities']:
+        if r['type'] == 2:
+            return r['data']
+    return None
+
+
+def resolve(
+    domain_name: str,
+    qtype: int = 1,
+    root_servers: Sequence[str] = DEFAULT_ROOT_SERVERS,
+    send_parse_func: Callable[[str, str, int], Dict[str, Any]] | None = None,
+) -> str:
+    """Iterative resolver: start at a root server and follow referrals.
+
+    send_parse_func should accept (server_ip, domain_name, qtype) and return
+    a parsed packet (the dict returned by parse_dns_packet). If None, the
+    default function will send a UDP query and parse the response.
+    """
+    if send_parse_func is None:
+        def default_send_parse(srv: str, name: str, qt: int) -> Dict[str, Any]:
+            raw = send_query_raw(srv, name, qt)
+            return parse_dns_packet(raw)
+
+        send_parse_func = default_send_parse
+
+    qname = normalize_name(domain_name)
+    nameserver = root_servers[0]
+    # simple loop (no caching, no CNAME handling here)
+    while True:
+        pkt = send_parse_func(nameserver, qname, qtype)
+        ans = get_answer(pkt)
+        if ans:
+            return ans
+        ns_ip = get_nameserver_ip(pkt)
+        if ns_ip:
+            nameserver = ns_ip
+            continue
+        ns_name = get_nameserver(pkt)
+        if ns_name:
+            # resolve the NS name to an IP (recursive call using same send_parse_func)
+            nameserver = resolve(ns_name, 1, root_servers=root_servers, send_parse_func=send_parse_func)
+            continue
+        raise LookupError(f'could not resolve {domain_name}')
+
+
 def _selftest() -> None:
-    # test encode/decode and a synthetic name compression case
-    enc = encode_dns_name('www.example.com')
-    name, off = decode_name(enc, 0)
-    assert name == 'www.example.com' and off == len(enc)
-    print('part2 self-test passed')
+    # fake parsed packets for testing resolver behavior without network
+    calls: List[Tuple[str, str, int]] = []
+
+    def fake_send_parse(server_ip: str, domain_name: str, qtype: int) -> Dict[str, Any]:
+        calls.append((server_ip, domain_name, qtype))
+        if server_ip == '198.41.0.4' and domain_name == 'example.com':
+            # referral to ns.example.net with glue
+            return {
+                'header': {'qdcount': 1, 'ancount': 0, 'nscount': 1, 'arcount': 1},
+                'questions': [],
+                'answers': [],
+                'authorities': [{'name': 'example.com', 'type': 2, 'class': 1, 'ttl': 10, 'data': 'ns.example.net'}],
+                'additionals': [{'name': 'ns.example.net', 'type': 1, 'class': 1, 'ttl': 10, 'data': '203.0.113.53'}],
+            }
+        if server_ip == '203.0.113.53' and domain_name == 'example.com':
+            return {
+                'header': {'qdcount': 1, 'ancount': 1, 'nscount': 0, 'arcount': 0},
+                'questions': [],
+                'answers': [{'name': 'example.com', 'type': 1, 'class': 1, 'ttl': 5, 'data': '93.184.216.34'}],
+                'authorities': [],
+                'additionals': [],
+            }
+        raise AssertionError(('unexpected', server_ip, domain_name, qtype))
+
+    assert resolve('example.com', send_parse_func=fake_send_parse) == '93.184.216.34'
+    assert calls == [('198.41.0.4', 'example.com', 1), ('203.0.113.53', 'example.com', 1)]
+    print('part3 self-test passed')
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -182,12 +266,8 @@ def main(argv: List[str] | None = None) -> int:
         return 0
     domain = args[0]
     if '--send' in args:
-        raw = send_query_raw(DEFAULT_ROOT_SERVERS[0], domain)
-        parsed = parse_dns_packet(raw)
-        print('parsed header:', parsed['header'])
+        parsed = parse_dns_packet(send_query_raw(DEFAULT_ROOT_SERVERS[0], domain))
         print('answers:', parsed['answers'])
-        print('authorities:', parsed['authorities'])
-        print('additionals:', parsed['additionals'])
     else:
         print(build_query(domain).hex())
     return 0
