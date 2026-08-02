@@ -27,8 +27,12 @@ DEFAULT_TIMEOUT = 3.0
 
 TYPE_A = 1
 TYPE_NS = 2
+TYPE_CNAME = 5
 
 CLASS_IN = 1
+
+# stop after this many CNAME hops so a loop cant hang us (Phase 3)
+MAX_CNAME_DEPTH = 10
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +155,7 @@ def parse_record(message: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
 
     if type_ == TYPE_A and rdlen == 4:
         data: Any = ".".join(str(b) for b in message[rdata_offset:rdata_end])
-    elif type_ == TYPE_NS:
+    elif type_ in (TYPE_NS, TYPE_CNAME):
         data, _ = decode_name(message, rdata_offset)
     else:
         data = message[rdata_offset:rdata_end]
@@ -191,6 +195,15 @@ def get_answers(packet: Dict[str, Any], name: str, rtype: int) -> List[str]:
     target = normalize_name(name)
     return [r["data"] for r in packet["answers"]
             if r["type"] == rtype and normalize_name(r["name"]) == target]
+
+
+def get_cname(packet: Dict[str, Any], name: str) -> Optional[str]:
+    # Phase 3: is there a CNAME where our answer should be?
+    target = normalize_name(name)
+    for r in packet["answers"]:
+        if r["type"] == TYPE_CNAME and normalize_name(r["name"]) == target:
+            return normalize_name(r["data"])
+    return None
 
 
 def get_glue_ip(packet: Dict[str, Any]) -> Optional[str]:
@@ -260,7 +273,7 @@ class DNSCache:
         # same TLD can skip the root and TLD hops
         for section in ("answers", "authorities", "additionals"):
             for r in packet.get(section, []):
-                if r["type"] in (TYPE_A, TYPE_NS):
+                if r["type"] in (TYPE_A, TYPE_NS, TYPE_CNAME):
                     try:
                         self.put_record(r)
                     except Exception:
@@ -328,7 +341,7 @@ def resolve(domain_name: str,
             cache: Optional[DNSCache] = None,
             counter: Optional[QueryCounter] = None,
             trace: bool = False,
-) -> List[str]:
+            _depth: int = 0) -> List[str]:
     """Walk the hierarchy and turn a name into a list of IPs.
 
     Its a list and not a single string because one name can have several A
@@ -341,6 +354,9 @@ def resolve(domain_name: str,
             return parse_dns_packet(send_query_raw(srv, name, qt))
         send_parse_func = default_send_parse
 
+    if _depth > MAX_CNAME_DEPTH:
+        raise LookupError(f"CNAME chain too long while resolving {domain_name}")
+
     qname = normalize_name(domain_name)
 
     # Phase 2: if we already have the answer, just hand it back
@@ -349,6 +365,14 @@ def resolve(domain_name: str,
         if trace:
             print(f"  [cache hit] {qname} -> {cached}")
         return cached
+
+    # Phase 3: a CNAME we already know still saves us the trip
+    cached_cname = cache.lookup_data(qname, TYPE_CNAME)
+    if cached_cname:
+        if trace:
+            print(f"  [cache hit] {qname} is a CNAME for {cached_cname[0]}")
+        return resolve(cached_cname[0], qtype, root_servers, send_parse_func,
+                       cache, counter, trace, _depth + 1)
 
     # Phase 2: start as far down the tree as the cache lets us
     nameserver, zone = cache.best_nameserver(qname)
@@ -372,6 +396,14 @@ def resolve(domain_name: str,
         if answers:
             return answers
 
+        # Phase 3: chase the CNAME, RFC 1034 section 3.6.2
+        cname = get_cname(packet, qname)
+        if cname:
+            if trace:
+                print(f"  {qname} is a CNAME for {cname}, restarting")
+            return resolve(cname, qtype, root_servers, send_parse_func,
+                           cache, counter, trace, _depth + 1)
+
         glue = get_glue_ip(packet)
         if glue:
             nameserver = glue
@@ -381,7 +413,7 @@ def resolve(domain_name: str,
         if ns_name:
             # no glue this time, so we have to go resolve the nameservers name
             ns_ips = resolve(ns_name, TYPE_A, root_servers, send_parse_func,
-                             cache, counter, trace)
+                             cache, counter, trace, _depth + 1)
             nameserver = ns_ips[0]
             continue
 
