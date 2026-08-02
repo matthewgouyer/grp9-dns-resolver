@@ -34,6 +34,8 @@ CLASS_IN = 1
 
 RCODE_NOERROR = 0
 RCODE_NXDOMAIN = 3
+RCODE_SERVFAIL = 2
+RCODE_REFUSED = 5
 
 # stop after this many CNAME hops so a loop cant hang us (Phase 3)
 MAX_CNAME_DEPTH = 10
@@ -233,13 +235,15 @@ def get_cname(packet: Dict[str, Any], name: str) -> Optional[str]:
     return None
 
 
-def get_glue_ip(packet: Dict[str, Any]) -> Optional[str]:
+def get_glue_ips(packet: Dict[str, Any]) -> List[str]:
     """Glue records are A records in the additional section that hand us a
-    nameservers IP for free, so we dont have to go look it up separately."""
-    for r in packet["additionals"]:
-        if r["type"] == TYPE_A:
-            return r["data"]
-    return None
+    nameservers IP for free, so we dont have to go look it up separately.
+
+    We return all of them, not just the first. A zone usually lists several
+    nameservers and any one of them can be down or refuse to answer us, so we
+    want backups to fall back on (RFC 1034 section 5.3.3).
+    """
+    return [r["data"] for r in packet["additionals"] if r["type"] == TYPE_A]
 
 
 def get_ns_name(packet: Dict[str, Any]) -> Optional[str]:
@@ -442,13 +446,37 @@ def resolve(domain_name: str,
     else:
         nameserver = root_servers[0]
 
-    while True:
-        if trace:
-            print(f"  querying {nameserver} for {qname}")
-        if counter is not None:
-            counter.record(nameserver, qname, qtype)
+    servers = [nameserver]
 
-        packet = send_parse_func(nameserver, qname, qtype)
+    while True:
+        # Try each server we know about for this step. Any of them can time
+        # out or hand back SERVFAIL, so we keep going until one actually
+        # answers instead of giving up on the first bad one.
+        packet = None
+        for srv in servers:
+            if trace:
+                print(f"  querying {srv} for {qname}")
+            if counter is not None:
+                counter.record(srv, qname, qtype)
+            try:
+                candidate = send_parse_func(srv, qname, qtype)
+            except (socket.timeout, OSError, ValueError) as e:
+                if trace:
+                    print(f"    {srv} did not answer ({e}), trying the next one")
+                continue
+            rc = candidate["header"].get("rcode", RCODE_NOERROR)
+            if rc in (RCODE_SERVFAIL, RCODE_REFUSED):
+                if trace:
+                    print(f"    {srv} returned rcode {rc}, trying the next one")
+                continue
+            packet = candidate
+            break
+
+        if packet is None:
+            raise LookupError(
+                f"no nameserver would answer for {domain_name} "
+                f"(tried {len(servers)}: {', '.join(servers)})")
+
         cache.put_packet(packet)
 
         rcode = packet["header"].get("rcode", RCODE_NOERROR)
@@ -477,9 +505,9 @@ def resolve(domain_name: str,
             return resolve(cname, qtype, root_servers, send_parse_func,
                            cache, counter, trace, _depth + 1)
 
-        glue = get_glue_ip(packet)
+        glue = get_glue_ips(packet)
         if glue:
-            nameserver = glue
+            servers = glue
             continue
 
         ns_name = get_ns_name(packet)
@@ -487,10 +515,176 @@ def resolve(domain_name: str,
             # no glue this time, so we have to go resolve the nameservers name
             ns_ips = resolve(ns_name, TYPE_A, root_servers, send_parse_func,
                              cache, counter, trace, _depth + 1)
-            nameserver = ns_ips[0]
+            servers = ns_ips
             continue
 
         raise LookupError(f"could not resolve {domain_name}")
+
+
+# ---------------------------------------------------------------------------
+# Tests we can run without the network
+# ---------------------------------------------------------------------------
+
+def _fake_soa(minimum: int = 30, ttl: int = 60) -> Dict[str, Any]:
+    return {"name": "com", "type": TYPE_SOA, "class": CLASS_IN, "ttl": ttl,
+            "data": {"mname": "a.gtld-servers.net", "rname": "nstld.verisign-grs.com",
+                     "serial": 1, "refresh": 1800, "retry": 900,
+                     "expire": 604800, "minimum": minimum}}
+
+
+def _pkt(answers=(), authorities=(), additionals=(), rcode=0) -> Dict[str, Any]:
+    return {"header": {"rcode": rcode, "qdcount": 1, "ancount": len(answers),
+                       "nscount": len(authorities), "arcount": len(additionals)},
+            "questions": [], "answers": list(answers),
+            "authorities": list(authorities), "additionals": list(additionals)}
+
+
+def _rr(name, rtype, data, ttl=300):
+    return {"name": name, "type": rtype, "class": CLASS_IN, "ttl": ttl, "data": data}
+
+
+def _selftest() -> None:
+    fake_time = [1000.0]
+
+    def clock() -> float:
+        return fake_time[0]
+
+    # small fake zone so the tests dont need the network
+    def make_world():
+        def send(server: str, name: str, qtype: int) -> Dict[str, Any]:
+            name = normalize_name(name)
+            if server == "198.41.0.4":  # root: refer to .com
+                return _pkt(authorities=[_rr("com", TYPE_NS, "a.gtld-servers.net", 172800)],
+                            additionals=[_rr("a.gtld-servers.net", TYPE_A, "192.5.6.30", 172800)])
+            if server == "192.5.6.30":  # .com TLD
+                if name in ("example.com", "www.example.com"):
+                    return _pkt(authorities=[_rr("example.com", TYPE_NS, "ns.example.com", 3600)],
+                                additionals=[_rr("ns.example.com", TYPE_A, "203.0.113.53", 3600)])
+                if name == "shop.example.com":
+                    return _pkt(authorities=[_rr("example.com", TYPE_NS, "ns.example.com", 3600)],
+                                additionals=[_rr("ns.example.com", TYPE_A, "203.0.113.53", 3600)])
+                if name == "nonexistent-xyz.com":
+                    return _pkt(authorities=[_fake_soa(minimum=30, ttl=60)], rcode=RCODE_NXDOMAIN)
+                return _pkt(rcode=RCODE_NXDOMAIN, authorities=[_fake_soa()])
+            if server == "203.0.113.53":  # authoritative for example.com
+                if name == "example.com":
+                    return _pkt(answers=[_rr("example.com", TYPE_A, "93.184.216.34", 20),
+                                         _rr("example.com", TYPE_A, "93.184.216.35", 20)])
+                if name == "www.example.com":
+                    return _pkt(answers=[_rr("www.example.com", TYPE_CNAME, "example.com", 300)])
+                if name == "shop.example.com":
+                    return _pkt(answers=[_rr("shop.example.com", TYPE_A, "198.51.100.7", 300)])
+            raise AssertionError(("unexpected query", server, name, qtype))
+        return send
+
+    # 1. full walk from root to TLD to authoritative, with two A records
+    cache = DNSCache(clock=clock)
+    c = QueryCounter()
+    ips = resolve("example.com", cache=cache, counter=c, send_parse_func=make_world())
+    assert ips == ["93.184.216.34", "93.184.216.35"], ips
+    assert c.count == 3, c.log
+    print("  [1] baseline walk returns both A records in 3 queries")
+
+    # 2. doing it again should come straight out of the cache
+    before = c.count
+    ips2 = resolve("example.com", cache=cache, counter=c, send_parse_func=make_world())
+    assert ips2 == ips
+    assert c.count == before, "repeat lookup should send zero packets"
+    print("  [2] repeat lookup sent 0 new queries")
+
+    # 3. the A records had a TTL of 20, so push the clock past that
+    fake_time[0] += 25
+    before = c.count
+    ips3 = resolve("example.com", cache=cache, counter=c, send_parse_func=make_world())
+    assert ips3 == ips
+    assert c.count > before, "expired entry should be re-fetched"
+    print(f"  [3] after TTL expiry the resolver re-queried ({c.count - before} queries)")
+
+    # 4. a different name in the same zone should reuse the cached NS and glue
+    before = c.count
+    shop = resolve("shop.example.com", cache=cache, counter=c, send_parse_func=make_world())
+    assert shop == ["198.51.100.7"], shop
+    used = c.log[before:]
+    assert all(s != "198.41.0.4" for (s, _, _) in used), used
+    print(f"  [4] shop.example.com skipped the root, {len(used)} query(s), "
+          f"started at {used[0][0]}")
+
+    # 5. Phase 3: following a CNAME
+    cache2 = DNSCache(clock=clock)
+    c2 = QueryCounter()
+    www = resolve("www.example.com", cache=cache2, counter=c2, send_parse_func=make_world())
+    assert www == ["93.184.216.34", "93.184.216.35"], www
+    print("  [5] www.example.com followed its CNAME to the A records")
+
+    # 6. Phase 3: caching an NXDOMAIN
+    cache3 = DNSCache(clock=clock)
+    c3 = QueryCounter()
+    try:
+        resolve("nonexistent-xyz.com", cache=cache3, counter=c3, send_parse_func=make_world())
+        raise AssertionError("should have raised NXDomainError")
+    except NXDomainError:
+        pass
+    first = c3.count
+    try:
+        resolve("nonexistent-xyz.com", cache=cache3, counter=c3, send_parse_func=make_world())
+        raise AssertionError("should have raised NXDomainError")
+    except NXDomainError:
+        pass
+    assert c3.count == first, "second NXDOMAIN lookup should send zero packets"
+    print(f"  [6] NXDOMAIN cached, second lookup sent 0 queries (neg TTL 30s)")
+
+    # 7. that negative entry should expire once its TTL runs out
+    fake_time[0] += 35
+    before = c3.count
+    try:
+        resolve("nonexistent-xyz.com", cache=cache3, counter=c3, send_parse_func=make_world())
+    except NXDomainError:
+        pass
+    assert c3.count > before, "negative entry should expire"
+    print("  [7] negative entry expired after 30s and was re-queried")
+
+    # 8. check the SOA parser against bytes we built by hand
+    msg = (b"\x00" * 12 + b"\x03foo\x00" + struct.pack("!HHIH", TYPE_SOA, 1, 60, 0))
+    start = len(msg)
+    msg += b"\x02ns\x00" + b"\x04mail\x00" + struct.pack("!IIIII", 7, 1800, 900, 604800, 45)
+    soa = parse_soa_rdata(msg, start)
+    assert soa["minimum"] == 45 and soa["mname"] == "ns", soa
+    print("  [8] SOA parser found MINIMUM=45 past both variable-length names")
+
+    # 9. a pointer loop should get rejected
+    bad = b"\x00" * 12 + b"\xc0\x0c"
+    try:
+        decode_name(bad, 12)
+        raise AssertionError("pointer loop should raise")
+    except ValueError:
+        pass
+    print("  [9] self-referencing compression pointer rejected")
+
+    # 10. a dead nameserver should not stop us, we try the next one
+    def flaky(server: str, name: str, qtype: int) -> Dict[str, Any]:
+        name = normalize_name(name)
+        if server == "198.41.0.4":
+            return _pkt(authorities=[_rr("edu", TYPE_NS, "a.edu-servers.net", 172800)],
+                        additionals=[_rr("a.edu-servers.net", TYPE_A, "192.0.2.1", 172800)])
+        if server == "192.0.2.1":
+            # this TLD server hands back two nameservers for the zone
+            return _pkt(authorities=[_rr("sjsu.edu", TYPE_NS, "ns1.sjsu.edu", 3600)],
+                        additionals=[_rr("ns1.sjsu.edu", TYPE_A, "198.51.100.1", 3600),
+                                     _rr("ns2.sjsu.edu", TYPE_A, "198.51.100.2", 3600)])
+        if server == "198.51.100.1":
+            return _pkt(rcode=RCODE_SERVFAIL)   # first one is broken
+        if server == "198.51.100.2":
+            return _pkt(answers=[_rr("sjsu.edu", TYPE_A, "130.65.218.11", 300)])
+        raise AssertionError(("unexpected", server, name))
+
+    cache4 = DNSCache(clock=clock)
+    c4 = QueryCounter()
+    got = resolve("sjsu.edu", cache=cache4, counter=c4, send_parse_func=flaky)
+    assert got == ["130.65.218.11"], got
+    assert ("198.51.100.1", "sjsu.edu", TYPE_A) in c4.log, c4.log
+    print("  [10] first nameserver returned SERVFAIL, fell back to the second")
+
+    print("\nall self-tests passed")
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +697,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args or args[0] in ("-h", "--help"):
         print("Usage: python resolver.py <domain> [--trace]")
         print("       python resolver.py <domain> --repeat 2   (show cache behavior)")
+        print("       python resolver.py --selftest")
+        return 0
+
+    if args[0] == "--selftest":
+        _selftest()
         return 0
 
     domain = args[0]
