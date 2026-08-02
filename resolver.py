@@ -28,11 +28,19 @@ DEFAULT_TIMEOUT = 3.0
 TYPE_A = 1
 TYPE_NS = 2
 TYPE_CNAME = 5
+TYPE_SOA = 6
 
 CLASS_IN = 1
 
+RCODE_NOERROR = 0
+RCODE_NXDOMAIN = 3
+
 # stop after this many CNAME hops so a loop cant hang us (Phase 3)
 MAX_CNAME_DEPTH = 10
+
+
+class NXDomainError(Exception):
+    """The server told us this name doesnt exist."""
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +139,7 @@ def parse_header(message: bytes) -> Tuple[Dict[str, int], int]:
     if len(message) < 12:
         raise ValueError("truncated header")
     id_, flags, qd, an, ns, ar = struct.unpack_from("!HHHHHH", message, 0)
-    return ({"id": id_, "flags": flags, "qdcount": qd,
+    return ({"id": id_, "flags": flags, "rcode": flags & 0xF, "qdcount": qd,
              "ancount": an, "nscount": ns, "arcount": ar}, 12)
 
 
@@ -141,6 +149,23 @@ def parse_question(message: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
         raise ValueError("truncated question")
     qtype, qclass = struct.unpack_from("!HH", message, offset)
     return ({"name": name, "type": qtype, "class": qclass}, offset + 4)
+
+
+def parse_soa_rdata(message: bytes, offset: int) -> Dict[str, Any]:
+    """Pull apart the SOA rdata (RFC 1035 section 3.3.13).
+
+    Its MNAME, then RNAME, then five 32-bit numbers. Both names are variable
+    length and can use compression, so theres no fixed offset to jump to. We
+    have to decode both of them just to find where the numbers start. MINIMUM
+    is the last one and its the value RFC 2308 wants for negative caching.
+    """
+    mname, offset = decode_name(message, offset)
+    rname, offset = decode_name(message, offset)
+    if offset + 20 > len(message):
+        raise ValueError("truncated SOA")
+    serial, refresh, retry, expire, minimum = struct.unpack_from("!IIIII", message, offset)
+    return {"mname": mname, "rname": rname, "serial": serial, "refresh": refresh,
+            "retry": retry, "expire": expire, "minimum": minimum}
 
 
 def parse_record(message: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
@@ -157,6 +182,8 @@ def parse_record(message: bytes, offset: int) -> Tuple[Dict[str, Any], int]:
         data: Any = ".".join(str(b) for b in message[rdata_offset:rdata_end])
     elif type_ in (TYPE_NS, TYPE_CNAME):
         data, _ = decode_name(message, rdata_offset)
+    elif type_ == TYPE_SOA:
+        data = parse_soa_rdata(message, rdata_offset)
     else:
         data = message[rdata_offset:rdata_end]
 
@@ -222,6 +249,14 @@ def get_ns_name(packet: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def get_soa(packet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Phase 3: the SOA carries the TTL we use for negative caching
+    for r in packet["authorities"]:
+        if r["type"] == TYPE_SOA and isinstance(r["data"], dict):
+            return r
+    return None
+
+
 def parent_names(name: str) -> List[str]:
     # www.iana.org -> www.iana.org, iana.org, org, "" (root)
     name = normalize_name(name)
@@ -240,13 +275,14 @@ def parent_names(name: str) -> List[str]:
 class DNSCache:
     """Cache keyed by (lowercased name, type) that pays attention to TTLs.
 
-    It holds records from any section of a response, and drops them once
-    their TTL is up (RFC 1035 sections 3.2.1 and 4.1.3).
+    It holds normal records (RFC 1035 sections 3.2.1 and 4.1.3) and, once
+    Phase 3 is in, NXDOMAIN entries too (RFC 2308).
     """
 
     def __init__(self, clock: Callable[[], float] = time.time) -> None:
         self._clock = clock
         self._store: Dict[Tuple[str, int], List[Tuple[Dict[str, Any], float]]] = {}
+        self._negative: Dict[Tuple[str, int], float] = {}
 
     def _key(self, name: str, rtype: int) -> Tuple[str, int]:
         return (normalize_name(name), rtype)
@@ -294,6 +330,23 @@ class DNSCache:
 
     def lookup_data(self, name: str, rtype: int) -> List[Any]:
         return [r["data"] for r in self.lookup(name, rtype)]
+
+    # --- negative caching (Phase 3) ---
+
+    def put_negative(self, name: str, rtype: int, ttl: int) -> None:
+        if ttl <= 0:
+            return
+        self._negative[self._key(name, rtype)] = self._clock() + ttl
+
+    def is_negative(self, name: str, rtype: int) -> bool:
+        key = self._key(name, rtype)
+        expiry = self._negative.get(key)
+        if expiry is None:
+            return False
+        if expiry <= self._clock():
+            del self._negative[key]
+            return False
+        return True
 
     # --- delegation lookup, the part that saves round trips ---
 
@@ -359,6 +412,12 @@ def resolve(domain_name: str,
 
     qname = normalize_name(domain_name)
 
+    # Phase 3: check the negative cache before anything else
+    if cache.is_negative(qname, qtype):
+        if trace:
+            print(f"  [negative cache hit] {qname} does not exist")
+        raise NXDomainError(f"{qname} does not exist (cached)")
+
     # Phase 2: if we already have the answer, just hand it back
     cached = cache.lookup_data(qname, qtype)
     if cached:
@@ -391,6 +450,20 @@ def resolve(domain_name: str,
 
         packet = send_parse_func(nameserver, qname, qtype)
         cache.put_packet(packet)
+
+        rcode = packet["header"].get("rcode", RCODE_NOERROR)
+
+        # Phase 3: negative caching, RFC 2308 sections 3 and 5
+        if rcode == RCODE_NXDOMAIN:
+            soa = get_soa(packet)
+            if soa is not None:
+                # RFC 2308 section 4 says take whichever is smaller, the SOA
+                # records own TTL or its MINIMUM field
+                neg_ttl = min(int(soa["ttl"]), int(soa["data"]["minimum"]))
+                cache.put_negative(qname, qtype, neg_ttl)
+                if trace:
+                    print(f"  [negative cached] {qname} NXDOMAIN for {neg_ttl}s")
+            raise NXDomainError(f"{qname} does not exist")
 
         answers = get_answers(packet, qname, qtype)
         if answers:
@@ -446,6 +519,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             ips = resolve(domain, counter=counter, trace=trace)
             for ip in ips:
                 print(ip)
+        except NXDomainError as e:
+            print(f"NXDOMAIN: {e}")
         except (LookupError, socket.timeout, OSError) as e:
             print(f"error: {e}")
             return 1
